@@ -1,18 +1,19 @@
 """
 Конфигурация бота-мониторинга.
 
-Скопируйте в config.py и заполните:
-  1. BOT_TOKEN — от @BotFather
-  2. TELETHON_API_ID / TELETHON_API_HASH — с https://my.telegram.org
+Скопируйте в config.py и заполните для локального запуска.
+Для деплоя на Render — используйте Environment Variables.
 """
 
+import os
+
 # ── Telegram Bot (от @BotFather) ────────────────────────────
-BOT_TOKEN = ""
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 
 # ── Telethon API (для мониторинга чатов) ────────────────────
 # Получить на https://my.telegram.org → API development tools
-TELETHON_API_ID = 0          # int
-TELETHON_API_HASH = ""       # str
+TELETHON_API_ID = int(os.environ.get("TELETHON_API_ID", "0"))
+TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "")
 
 # ── Хранилище ───────────────────────────────────────────────
-DATA_DIR = "data"            # Папка для данных (сессии, конфиги)
+DATA_DIR = os.environ.get("DATA_DIR", "data")
