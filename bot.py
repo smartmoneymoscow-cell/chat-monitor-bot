@@ -942,7 +942,11 @@ def main():
 
     # ── Запуск бота ──
     log.info("🚀 Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        log.error(f"❌ Ошибка запуска бота: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

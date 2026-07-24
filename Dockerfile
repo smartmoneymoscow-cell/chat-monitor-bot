@@ -5,4 +5,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV PORT=10000
 EXPOSE 10000
-CMD ["python3", "-u", "test_bot.py"]
+CMD ["python3", "-u", "bot.py"]
