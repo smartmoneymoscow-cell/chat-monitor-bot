@@ -4,4 +4,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 10000
-CMD ["python3", "bot.py"]
+CMD ["python3", "-u", "bot.py"]
