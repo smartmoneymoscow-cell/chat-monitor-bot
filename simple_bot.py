@@ -43,4 +43,8 @@ app = Application.builder().token(config.BOT_TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
 
 log.info("Starting bot...")
-app.run_polling(drop_pending_updates=True)
+try:
+    app.run_polling(drop_pending_updates=True)
+except Exception as e:
+    log.error(f"Bot error: {e}", exc_info=True)
+    sys.exit(1)
