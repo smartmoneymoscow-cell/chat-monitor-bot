@@ -29,15 +29,14 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, ContextTypes, filters,
 )
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 from telethon.errors import (
     PhoneCodeInvalidError, PhoneCodeExpiredError,
     SessionPasswordNeededError, PhoneNumberInvalidError,
 )
 
 import config
-import storage
 from healthcheck import start_health_server
+import storage
 
 # ── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -176,15 +175,18 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["phone"] = phone
 
-    # Проверяем, есть ли уже сессия в БД
-    acc = storage.get_account(update.effective_user.id, phone)
-    if acc and acc.get("session_string"):
+    # Проверяем, есть ли уже сессия
+    session_path = os.path.join(config.DATA_DIR, f"session_{phone.replace('+', 'plus')}")
+    if os.path.exists(session_path + ".session"):
+        # Пробуем подключиться без кода
         try:
-            tc = TelegramClient(StringSession(acc["session_string"]), config.TELETHON_API_ID, config.TELETHON_API_HASH)
+            tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
             await tc.connect()
             if await tc.is_user_authorized():
                 me = await tc.get_me()
                 await tc.disconnect()
+                # Сохраняем аккаунт
+                storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
                 storage.update_account(update.effective_user.id, phone, {"session_ok": True})
                 await update.message.reply_text(
                     f"✅ Аккаунт <b>{me.first_name}</b> ({phone}) уже авторизован!\n"
@@ -199,11 +201,11 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Запрашиваем код
     try:
-        tc = TelegramClient(StringSession(), config.TELETHON_API_ID, config.TELETHON_API_HASH)
+        tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
         await tc.connect()
         sent = await tc.send_code_request(phone)
         ctx.user_data["phone_code_hash"] = sent.phone_code_hash
-        ctx.user_data["tc_session"] = tc.session.save()
+        ctx.user_data["tc_session"] = session_path
         await tc.disconnect()
 
         await update.message.reply_text(
@@ -232,24 +234,19 @@ async def msg_add_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Шаг 3: ввод кода подтверждения."""
     code = update.message.text.strip().replace(" ", "")
     phone = ctx.user_data["phone"]
-    session_str = ctx.user_data.get("tc_session", "")
+    session_path = ctx.user_data["tc_session"]
     phone_code_hash = ctx.user_data["phone_code_hash"]
 
     try:
-        tc = TelegramClient(StringSession(session_str) if session_str else StringSession(), config.TELETHON_API_ID, config.TELETHON_API_HASH)
+        tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
         await tc.connect()
         await tc.sign_in(phone, code, phone_code_hash=phone_code_hash)
         me = await tc.get_me()
-
-        # Сохраняем строку сессии
-        saved_session = tc.session.save()
         await tc.disconnect()
 
+        # Сохраняем
         storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
-        storage.update_account(update.effective_user.id, phone, {
-            "session_ok": True,
-            "session_string": saved_session,
-        })
+        storage.update_account(update.effective_user.id, phone, {"session_ok": True})
 
         await update.message.reply_text(
             f"✅ Авторизация успешна! Аккаунт: <b>{me.first_name}</b> ({phone})\n\n"
@@ -289,22 +286,17 @@ async def msg_add_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Шаг 4: ввод пароля 2FA."""
     password = update.message.text.strip()
     phone = ctx.user_data["phone"]
-    session_str = ctx.user_data.get("tc_session", "")
+    session_path = ctx.user_data["tc_session"]
 
     try:
-        tc = TelegramClient(StringSession(session_str) if session_str else StringSession(), config.TELETHON_API_ID, config.TELETHON_API_HASH)
+        tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
         await tc.connect()
         await tc.sign_in(password=password)
         me = await tc.get_me()
-
-        saved_session = tc.session.save()
         await tc.disconnect()
 
         storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
-        storage.update_account(update.effective_user.id, phone, {
-            "session_ok": True,
-            "session_string": saved_session,
-        })
+        storage.update_account(update.effective_user.id, phone, {"session_ok": True})
 
         await update.message.reply_text(
             f"✅ Авторизация успешна! Аккаунт: <b>{me.first_name}</b> ({phone})",
@@ -729,13 +721,13 @@ async def forward_alert(
 
 async def start_telethon_client(phone: str, monitor_cfg: dict, bot_app: Application):
     """Запускает Telethon-клиент для одного аккаунта."""
-    session_string = monitor_cfg.get("session_string", "")
+    session_path = os.path.join(config.DATA_DIR, f"session_{phone.replace('+', 'plus')}")
 
-    if not session_string:
+    if not os.path.exists(session_path + ".session"):
         log.warning(f"Нет сессии для {phone}, пропускаем")
         return
 
-    tc = TelegramClient(StringSession(session_string), config.TELETHON_API_ID, config.TELETHON_API_HASH)
+    tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
 
     try:
         await tc.start()
@@ -881,13 +873,9 @@ def main():
 
     os.makedirs(config.DATA_DIR, exist_ok=True)
 
-    # ── Инициализация PostgreSQL ──
-    storage.init_db()
-    log.info("✅ База данных инициализирована")
-
     # ── Health check для Render Free ──
     start_health_server()
-    log.info("🏥 Health check запущен на PORT=%s", os.environ.get("PORT", 10000))
+    log.info("Health check started on PORT=%s", os.environ.get("PORT", 10000))
 
     # ── Строим приложение ──
     app = Application.builder().token(config.BOT_TOKEN).build()
@@ -954,16 +942,8 @@ def main():
 
     # ── Запуск бота ──
     log.info("🚀 Бот запущен!")
-    try:
-        app.run_polling(drop_pending_updates=True)
-    except Exception as e:
-        log.error(f"❌ Ошибка запуска бота: {e}", exc_info=True)
-        sys.exit(1)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log.error(f"❌ Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+    main()

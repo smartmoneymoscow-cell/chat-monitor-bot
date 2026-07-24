@@ -1,4 +1,4 @@
-"""Конфигурация — читает из Environment Variables (для Render)."""
+"""Конфигурация — читает из Environment Variables."""
 import os
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")

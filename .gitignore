@@ -3,4 +3,5 @@ __pycache__/
 *.session
 data/
 bot.log
+config.py
 .env
