@@ -36,6 +36,7 @@ from telethon.errors import (
 
 import config
 import storage
+from healthcheck import start_health_server
 
 # ── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -871,6 +872,10 @@ def main():
         sys.exit(1)
 
     os.makedirs(config.DATA_DIR, exist_ok=True)
+
+    # ── Health check для Render Free ──
+    start_health_server()
+    log.info("🏥 Health check запущен на PORT=%s", os.environ.get("PORT", 10000))
 
     # ── Строим приложение ──
     app = Application.builder().token(config.BOT_TOKEN).build()
