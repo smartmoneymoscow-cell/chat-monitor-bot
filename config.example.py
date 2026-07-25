@@ -8,7 +8,7 @@
 import os
 
 # ── Telegram Bot (от @BotFather) ────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # ── Telethon API (для мониторинга чатов) ────────────────────
 # Получить на https://my.telegram.org → API development tools
@@ -17,3 +17,6 @@ TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "")
 
 # ── Хранилище ───────────────────────────────────────────────
 DATA_DIR = os.environ.get("DATA_DIR", "data")
+
+# Бэкенд: "sqlite" (рекомендуется для Render) или "json"
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "sqlite")

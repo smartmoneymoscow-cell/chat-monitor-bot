@@ -3,11 +3,11 @@ Telegram-бот с inline-меню для настройки мониторин�
 
 Архитектура:
   - python-telegram-bot — интерфейс (меню, кнопки)
-  - Telethon — мониторинг чатов (фоновый поток)
-  - JSON — хранение настроек каждого пользователя
+  - Telethon — мониторинг чатов (asyncio tasks в общем event loop)
+  - SQLite или JSON — хранение настроек каждого пользователя
 
 Запуск:
-  1. Заполните config.py
+  1. Задайте переменные окружения BOT_TOKEN, TELETHON_API_ID, TELETHON_API_HASH
   2. pip install telethon python-telegram-bot
   3. python3 bot.py
 """
@@ -17,7 +17,6 @@ import re
 import sys
 import asyncio
 import logging
-import threading
 from datetime import datetime, timezone, timedelta
 
 from telegram import (
@@ -59,6 +58,11 @@ log = logging.getLogger("bot")
     STATE_ADD_KEYWORDS,
     STATE_SET_NOTIFY,
 ) = range(8)
+
+# ── Глобальные объекты ──────────────────────────────────────
+_telethon_tasks: dict[str, asyncio.Task] = {}      # phone → Task
+_telethon_clients: dict[str, TelegramClient] = {}   # phone → client
+_bot_app: Application | None = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -189,17 +193,21 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["phone"] = phone
 
-    # Проверяем, есть ли уже сессия
-    session_path = os.path.join(config.DATA_DIR, f"session_{phone.replace('+', 'plus')}")
-    if os.path.exists(session_path + ".session"):
-        # Пробуем подключиться без кода
+    # Проверяем, есть ли уже сессия (в БД или файле)
+    session_string = storage.get_session_string(phone)
+    if session_string:
         try:
-            tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+            tc = TelegramClient(
+                storage.StringSession(session_string),
+                config.TELETHON_API_ID, config.TELETHON_API_HASH,
+            )
             await tc.connect()
             if await tc.is_user_authorized():
                 me = await tc.get_me()
+                # Обновляем строку сессии (может измениться)
+                new_session = tc.session.save()
+                storage.save_session_string(phone, new_session)
                 await tc.disconnect()
-                # Сохраняем аккаунт
                 storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
                 storage.update_account(update.effective_user.id, phone, {"session_ok": True})
                 await update.message.reply_text(
@@ -215,11 +223,15 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Запрашиваем код
     try:
-        tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+        tc = TelegramClient(
+            storage.StringSession(),
+            config.TELETHON_API_ID, config.TELETHON_API_HASH,
+        )
         await tc.connect()
         sent = await tc.send_code_request(phone)
         ctx.user_data["phone_code_hash"] = sent.phone_code_hash
-        ctx.user_data["tc_session"] = session_path
+        # Сохраняем строку сессии во временное хранилище
+        ctx.user_data["tc_session_string"] = tc.session.save()
         await tc.disconnect()
 
         await update.message.reply_text(
@@ -248,17 +260,24 @@ async def msg_add_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Шаг 3: ввод кода подтверждения."""
     code = update.message.text.strip().replace(" ", "")
     phone = ctx.user_data["phone"]
-    session_path = ctx.user_data["tc_session"]
+    session_string = ctx.user_data["tc_session_string"]
     phone_code_hash = ctx.user_data["phone_code_hash"]
 
     try:
-        tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+        tc = TelegramClient(
+            storage.StringSession(session_string),
+            config.TELETHON_API_ID, config.TELETHON_API_HASH,
+        )
         await tc.connect()
         await tc.sign_in(phone, code, phone_code_hash=phone_code_hash)
         me = await tc.get_me()
+
+        # Сохраняем строку сессии в БД
+        final_session = tc.session.save()
+        storage.save_session_string(phone, final_session)
         await tc.disconnect()
 
-        # Сохраняем
+        # Сохраняем аккаунт
         storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
         storage.update_account(update.effective_user.id, phone, {"session_ok": True})
 
@@ -300,13 +319,19 @@ async def msg_add_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Шаг 4: ввод пароля 2FA."""
     password = update.message.text.strip()
     phone = ctx.user_data["phone"]
-    session_path = ctx.user_data["tc_session"]
+    session_string = ctx.user_data["tc_session_string"]
 
     try:
-        tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+        tc = TelegramClient(
+            storage.StringSession(session_string),
+            config.TELETHON_API_ID, config.TELETHON_API_HASH,
+        )
         await tc.connect()
         await tc.sign_in(password=password)
         me = await tc.get_me()
+
+        final_session = tc.session.save()
+        storage.save_session_string(phone, final_session)
         await tc.disconnect()
 
         storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
@@ -399,7 +424,6 @@ async def msg_add_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         line = line.strip()
         if not line:
             continue
-        # Нормализуем
         chat_id = line
         if "t.me/" in line:
             chat_id = "@" + line.split("t.me/")[-1].strip("/")
@@ -589,7 +613,6 @@ async def msg_set_notify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             notify_id = int(text)
         except ValueError:
-            # Попробуем как username
             await update.message.reply_text(
                 "❌ Введите числовой ID или <code>me</code>",
                 parse_mode="HTML",
@@ -678,8 +701,8 @@ async def cb_start_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             acc["active"] = True
     storage.save_user(user_id, data)
 
-    # Перезапускаем Telethon-мониторинг
-    restart_telethon_monitor(ctx.application)
+    # Перезапускаем Telethon-мониторинг (async)
+    await restart_telethon_monitor()
 
     text = "✅ <b>Мониторинг запущен!</b>\n\n"
     for acc in ready:
@@ -704,7 +727,7 @@ async def cb_stop_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         acc["active"] = False
     storage.save_user(user_id, data)
 
-    restart_telethon_monitor(ctx.application)
+    await stop_telethon_monitor()
 
     await safe_edit(
         q,
@@ -761,14 +784,17 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = storage.load_user(user_id)
     notify_id = data.get("notify_chat_id", user_id)
 
-    session_path = os.path.join(config.DATA_DIR, f"session_{phone.replace('+', 'plus')}")
-    if not os.path.exists(session_path + ".session"):
-        await safe_edit(q, "❌ Файл сессии не найден.", reply_markup=main_menu_keyboard())
+    session_string = storage.get_session_string(phone)
+    if not session_string:
+        await safe_edit(q, "❌ Сессия не найдена.", reply_markup=main_menu_keyboard())
         return STATE_MENU
 
     await safe_edit(q, "⏳ <b>Ищу сообщения за последний месяц...</b>\nЭто может занять несколько минут.", parse_mode="HTML")
 
-    tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+    tc = TelegramClient(
+        storage.StringSession(session_string),
+        config.TELETHON_API_ID, config.TELETHON_API_HASH,
+    )
     found_total = 0
     errors = []
 
@@ -782,7 +808,6 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for chat_id in acc["chats"]:
             try:
-                # Нормализуем ID чата
                 try:
                     entity = int(chat_id)
                 except ValueError:
@@ -790,7 +815,6 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 chat_found = 0
                 async for msg in tc.iter_messages(entity, offset_date=datetime.now(timezone.utc), reverse=False):
-                    # iter_messages с reverse=False идёт от новых к старым
                     if msg.date < since:
                         break
                     if not msg.text:
@@ -830,7 +854,6 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         msg_link = f"https://t.me/c/{raw}/{msg.id}"
 
                     await forward_alert(
-                        bot_app=ctx.application,
                         notify_chat_id=notify_id,
                         chat_title=chat_title,
                         chat_username=chat_username,
@@ -861,7 +884,6 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # Итог
     result = f"✅ <b>Поиск завершён!</b>\nНайдено: <b>{found_total}</b> сообщений за 30 дней."
     if errors:
         result += "\n\n⚠️ Ошибки:\n" + "\n".join(f"  • {e}" for e in errors[:5])
@@ -870,13 +892,8 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════
-#  TELETHON-МОНИТОРИНГ (фоновый поток)
+#  TELETHON-МОНИТОРИНГ (asyncio tasks, ОДИН event loop)
 # ═══════════════════════════════════════════════════════════
-
-_telethon_clients: dict[str, TelegramClient] = {}
-_telethon_loop: asyncio.AbstractEventLoop | None = None
-_bot_app: Application | None = None
-
 
 def find_keywords(text: str, keywords: list[str]) -> list[str]:
     """Ищет ключевые слова в тексте (регистронезависимо)."""
@@ -887,7 +904,6 @@ def find_keywords(text: str, keywords: list[str]) -> list[str]:
 
 
 async def forward_alert(
-    bot_app: Application,
     notify_chat_id: int,
     chat_title: str,
     chat_username: str | None,
@@ -900,6 +916,11 @@ async def forward_alert(
     msg_date: datetime,
 ):
     """Отправляет уведомление через Telegram Bot API."""
+    global _bot_app
+    if not _bot_app:
+        log.error("forward_alert: _bot_app не инициализирован")
+        return
+
     moscow_tz = timezone(timedelta(hours=3))
     time_str = msg_date.astimezone(moscow_tz).strftime("%d.%m.%Y %H:%M MSK")
 
@@ -928,7 +949,7 @@ async def forward_alert(
     lines.extend(["", "📝 <b>Текст:</b>", f"<blockquote>{text_preview}</blockquote>"])
 
     try:
-        await bot_app.bot.send_message(
+        await _bot_app.bot.send_message(
             chat_id=notify_chat_id,
             text="\n".join(lines),
             parse_mode="HTML",
@@ -938,20 +959,27 @@ async def forward_alert(
         log.error(f"Ошибка отправки уведомления → {notify_chat_id}: {e}")
 
 
-async def start_telethon_client(phone: str, monitor_cfg: dict, bot_app: Application):
-    """Запускает Telethon-клиент для одного аккаунта."""
-    session_path = os.path.join(config.DATA_DIR, f"session_{phone.replace('+', 'plus')}")
+async def telethon_client_task(phone: str, monitor_cfg: dict):
+    """Запускает Telethon-клиент для одного аккаунта (asyncio task)."""
+    global _bot_app
 
-    if not os.path.exists(session_path + ".session"):
+    session_string = storage.get_session_string(phone)
+    if not session_string:
         log.warning(f"Нет сессии для {phone}, пропускаем")
         return
 
-    tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+    tc = TelegramClient(
+        storage.StringSession(session_string),
+        config.TELETHON_API_ID, config.TELETHON_API_HASH,
+    )
 
     try:
         await tc.start()
         me = await tc.get_me()
         log.info(f"✅ Telethon {phone} ({me.first_name}) подключён")
+
+        # Сохраняем обновлённую строку сессии
+        storage.save_session_string(phone, tc.session.save())
 
         chats = monitor_cfg["chats"]
         keywords = monitor_cfg["keywords"]
@@ -963,7 +991,7 @@ async def start_telethon_client(phone: str, monitor_cfg: dict, bot_app: Applicat
             try:
                 resolved_chats.add(int(c))
             except ValueError:
-                resolved_chats.add(c)  # username
+                resolved_chats.add(c)
 
         @tc.on(events.NewMessage(chats=list(resolved_chats) if resolved_chats else None))
         async def on_new_message(event):
@@ -1002,7 +1030,6 @@ async def start_telethon_client(phone: str, monitor_cfg: dict, bot_app: Applicat
                     msg_link = f"https://t.me/c/{raw}/{event.message.id}"
 
                 await forward_alert(
-                    bot_app=bot_app,
                     notify_chat_id=notify_id,
                     chat_title=chat_title,
                     chat_username=chat_username,
@@ -1030,52 +1057,53 @@ async def start_telethon_client(phone: str, monitor_cfg: dict, bot_app: Applicat
         except Exception:
             pass
         _telethon_clients.pop(phone, None)
+        _telethon_tasks.pop(phone, None)
 
 
-def telethon_worker(bot_app: Application):
-    """Фоновый поток: запускает все Telethon-клиенты."""
-    global _telethon_loop
-    _telethon_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_telethon_loop)
+async def restart_telethon_monitor():
+    """Перезапускает Telethon-мониторинг (async)."""
+    # Останавливаем старые задачи
+    for phone, task in list(_telethon_tasks.items()):
+        task.cancel()
+        log.info(f"Остановлен мониторинг: {phone}")
+    _telethon_tasks.clear()
 
-    async def run_all():
-        monitors = storage.get_all_active_monitors()
-        if not monitors:
-            log.info("Нет активных мониторингов")
-            return
-
-        tasks = []
-        for m in monitors:
-            log.info(f"Запуск мониторинга: {m['phone']} → {m['chats']}")
-            tasks.append(start_telethon_client(m["phone"], m, bot_app))
-
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    _telethon_loop.run_until_complete(run_all())
-
-
-_telethon_thread: threading.Thread | None = None
-
-
-def restart_telethon_monitor(app: Application):
-    """Перезапускает Telethon-мониторинг (после изменения настроек)."""
-    global _telethon_thread, _telethon_loop
-
-    # Останавливаем старых клиентов
+    # Закрываем старых клиентов
     for phone, tc in list(_telethon_clients.items()):
         try:
-            if _telethon_loop and _telethon_loop.is_running():
-                asyncio.run_coroutine_threadsafe(tc.disconnect(), _telethon_loop)
+            await tc.disconnect()
         except Exception:
             pass
     _telethon_clients.clear()
 
-    # Запускаем новый поток
-    _telethon_thread = threading.Thread(
-        target=telethon_worker, args=(app,), daemon=True,
-    )
-    _telethon_thread.start()
+    # Запускаем новые задачи
+    monitors = storage.get_all_active_monitors()
+    if not monitors:
+        log.info("Нет активных мониторингов")
+        return
+
+    for m in monitors:
+        log.info(f"Запуск мониторинга: {m['phone']} → {m['chats']}")
+        task = asyncio.create_task(telethon_client_task(m["phone"], m))
+        _telethon_tasks[m["phone"]] = task
+
     log.info("🔄 Telethon-мониторинг перезапущен")
+
+
+async def stop_telethon_monitor():
+    """Останавливает все Telethon-клиенты."""
+    for phone, task in list(_telethon_tasks.items()):
+        task.cancel()
+        log.info(f"Остановлен мониторинг: {phone}")
+    _telethon_tasks.clear()
+
+    for phone, tc in list(_telethon_clients.items()):
+        try:
+            await tc.disconnect()
+        except Exception:
+            pass
+    _telethon_clients.clear()
+    log.info("⏹ Все Telethon-клиенты остановлены")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1083,28 +1111,32 @@ def restart_telethon_monitor(app: Application):
 # ═══════════════════════════════════════════════════════════
 
 def main():
+    global _bot_app
+
     if not config.BOT_TOKEN:
-        print("❌ Заполните BOT_TOKEN в config.py!")
+        print("❌ Задайте переменную окружения BOT_TOKEN!")
         sys.exit(1)
     if not config.TELETHON_API_ID or not config.TELETHON_API_HASH:
-        print("❌ Заполните TELETHON_API_ID и TELETHON_API_HASH в config.py!")
+        print("❌ Задайте переменные окружения TELETHON_API_ID и TELETHON_API_HASH!")
         sys.exit(1)
-
-    os.makedirs(config.DATA_DIR, exist_ok=True)
 
     # ── Health check для Render Free ──
     start_health_server()
     log.info("Health check started on PORT=%s", os.environ.get("PORT", 10000))
 
-    # ── Запуск Telethon в фоне ──
+    # ── post_init: запуск Telethon-мониторинга ──
     async def post_init(application: Application):
-        t = threading.Thread(target=telethon_worker, args=(application,), daemon=True)
-        t.start()
-        log.info("🔄 Telethon-мониторинг запущен в фоне")
+        global _bot_app
+        _bot_app = application
+        asyncio.create_task(restart_telethon_monitor())
+        log.info("🔄 Telethon-мониторинг запускается...")
 
-    # ── Обработчик для неизвестных callback_query (вне ConversationHandler) ──
+    # ── post_shutdown: остановка Telethon ──
+    async def post_shutdown(application: Application):
+        await stop_telethon_monitor()
+
+    # ── Обработчик для неизвестных callback_query ──
     async def cb_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        """Отвечаем на неизвестные callback, чтобы не было часиков."""
         if update.callback_query:
             await update.callback_query.answer()
             await safe_edit(
@@ -1117,6 +1149,7 @@ def main():
         Application.builder()
         .token(config.BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -1175,7 +1208,6 @@ def main():
     )
 
     app.add_handler(conv)
-    # Глобальный обработчик невалидных callback (ловит то, что не поймал ConversationHandler)
     app.add_handler(CallbackQueryHandler(cb_unknown), group=1)
 
     # ── Запуск бота ──

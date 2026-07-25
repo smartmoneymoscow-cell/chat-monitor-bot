@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 *.session
+*.session_str
 data/
 bot.log
 config.py
 .env
+*.db
