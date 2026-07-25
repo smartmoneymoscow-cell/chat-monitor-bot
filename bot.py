@@ -18,6 +18,7 @@ import sys
 import asyncio
 import logging
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 from telegram import (
@@ -66,6 +67,8 @@ _telethon_loop: asyncio.AbstractEventLoop | None = None
 _telethon_thread: threading.Thread | None = None
 _bot_app: Application | None = None
 _bot_loop: asyncio.AbstractEventLoop | None = None
+_last_update_time: float = time.time()
+_polling_alive: bool = False
 
 
 def get_state(user_id: int) -> dict:
@@ -1000,9 +1003,16 @@ def main():
         global _bot_app, _bot_loop
         _bot_app = application
         _bot_loop = asyncio.get_event_loop()
-        t = threading.Thread(target=telethon_worker, daemon=True)
-        t.start()
-        log.info("🔄 Telethon запущен")
+        print("post_init called", flush=True)
+        log.info("post_init called")
+        try:
+            t = threading.Thread(target=telethon_worker, daemon=True)
+            t.start()
+            log.info("🔄 Telethon запущен")
+            print("🔄 Telethon thread started", flush=True)
+        except Exception as e:
+            log.error(f"Telethon start failed: {e}", exc_info=True)
+            print(f"❌ Telethon failed: {e}", flush=True)
 
     app = (
         Application.builder()
@@ -1034,8 +1044,14 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("🚀 Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    log.info("🚀 Бот запущен! Calling run_polling...")
+    print("🚀 About to call run_polling", flush=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        log.error(f"run_polling crashed: {e}", exc_info=True)
+        print(f"❌ run_polling CRASHED: {e}", flush=True)
+        raise
 
 
 async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
