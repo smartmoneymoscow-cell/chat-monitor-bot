@@ -72,6 +72,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔑 Добавить ключевые слова", callback_data="add_keywords")],
         [InlineKeyboardButton("🔔 Куда слать уведомления", callback_data="set_notify")],
         [InlineKeyboardButton("📋 Мои настройки", callback_data="my_settings")],
+        [InlineKeyboardButton("📜 История за месяц", callback_data="forward_history")],
         [InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="start_monitor")],
         [InlineKeyboardButton("⏹ Остановить мониторинг", callback_data="stop_monitor")],
     ])
@@ -714,6 +715,161 @@ async def cb_stop_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════
+#  7. ПЕРЕСЫЛКА ИСТОРИИ ЗА МЕСЯЦ
+# ═══════════════════════════════════════════════════════════
+
+async def cb_forward_history_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбор аккаунта для пересылки истории."""
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    data = storage.load_user(user_id)
+
+    ready = [a for a in data["accounts"] if a.get("session_ok") and a.get("chats") and a.get("keywords")]
+    if not ready:
+        await safe_edit(
+            q,
+            "❌ Нет аккаунтов с полной настройкой.\n\n"
+            "Нужно: авторизованный аккаунт + чаты + ключевые слова.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return STATE_MENU
+
+    await safe_edit(
+        q,
+        "📜 <b>Пересылка истории за месяц</b>\n\n"
+        "Выберите аккаунт. Бот найдёт все сообщения с ключевыми словами "
+        "в отслеживаемых чатах за последние 30 дней и перешлёт уведомления.",
+        parse_mode="HTML",
+        reply_markup=accounts_keyboard(user_id, "select_acc_history"),
+    )
+    return STATE_MENU
+
+
+async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Запуск поиска истории для выбранного аккаунта."""
+    q = update.callback_query
+    await q.answer("⏳ Ищу сообщения...", show_alert=True)
+    phone = q.data.split(":")[1]
+    user_id = update.effective_user.id
+    acc = storage.get_account(user_id, phone)
+
+    if not acc or not acc.get("session_ok"):
+        await safe_edit(q, "❌ Аккаунт не авторизован.", reply_markup=main_menu_keyboard())
+        return STATE_MENU
+
+    data = storage.load_user(user_id)
+    notify_id = data.get("notify_chat_id", user_id)
+
+    session_path = os.path.join(config.DATA_DIR, f"session_{phone.replace('+', 'plus')}")
+    if not os.path.exists(session_path + ".session"):
+        await safe_edit(q, "❌ Файл сессии не найден.", reply_markup=main_menu_keyboard())
+        return STATE_MENU
+
+    await safe_edit(q, "⏳ <b>Ищу сообщения за последний месяц...</b>\nЭто может занять несколько минут.", parse_mode="HTML")
+
+    tc = TelegramClient(session_path, config.TELETHON_API_ID, config.TELETHON_API_HASH)
+    found_total = 0
+    errors = []
+
+    try:
+        await tc.start()
+        me = await tc.get_me()
+        log.info(f"📜 [{phone}] Поиск истории запущен ({me.first_name})")
+
+        keywords = acc["keywords"]
+        since = datetime.now(timezone.utc) - timedelta(days=30)
+
+        for chat_id in acc["chats"]:
+            try:
+                # Нормализуем ID чата
+                try:
+                    entity = int(chat_id)
+                except ValueError:
+                    entity = chat_id
+
+                chat_found = 0
+                async for msg in tc.iter_messages(entity, offset_date=datetime.now(timezone.utc), reverse=False):
+                    # iter_messages с reverse=False идёт от новых к старым
+                    if msg.date < since:
+                        break
+                    if not msg.text:
+                        continue
+
+                    matched = find_keywords(msg.text, keywords)
+                    if not matched:
+                        continue
+
+                    chat_found += 1
+                    chat_entity = await msg.get_chat()
+                    user_entity = await msg.get_sender()
+
+                    chat_title = getattr(chat_entity, "title", "Личные сообщения")
+                    chat_username = getattr(chat_entity, "username", None)
+
+                    author_name = "Неизвестный"
+                    author_username = None
+                    author_id = None
+                    if user_entity:
+                        parts = []
+                        if getattr(user_entity, "first_name", None):
+                            parts.append(user_entity.first_name)
+                        if getattr(user_entity, "last_name", None):
+                            parts.append(user_entity.last_name)
+                        author_name = " ".join(parts) if parts else "Неизвестный"
+                        author_username = getattr(user_entity, "username", None)
+                        author_id = getattr(user_entity, "id", None)
+
+                    msg_link = None
+                    if chat_username:
+                        msg_link = f"https://t.me/{chat_username}/{msg.id}"
+                    elif msg.chat_id:
+                        raw = str(msg.chat_id)
+                        if raw.startswith("-100"):
+                            raw = raw[4:]
+                        msg_link = f"https://t.me/c/{raw}/{msg.id}"
+
+                    await forward_alert(
+                        bot_app=ctx.application,
+                        notify_chat_id=notify_id,
+                        chat_title=chat_title,
+                        chat_username=chat_username,
+                        author_name=author_name,
+                        author_username=author_username,
+                        author_id=author_id,
+                        msg_text=msg.text or "",
+                        msg_link=msg_link,
+                        matched_keywords=matched,
+                        msg_date=msg.date,
+                    )
+                    found_total += chat_found
+
+                log.info(f"📜 [{phone}] {chat_id}: {chat_found} совпадений")
+
+            except Exception as e:
+                errors.append(f"{chat_id}: {e}")
+                log.error(f"📜 Ошибка в чате {chat_id}: {e}")
+
+        await tc.disconnect()
+
+    except Exception as e:
+        errors.append(str(e))
+        log.error(f"📜 Ошибка Telethon: {e}")
+    finally:
+        try:
+            await tc.disconnect()
+        except Exception:
+            pass
+
+    # Итог
+    result = f"✅ <b>Поиск завершён!</b>\nНайдено: <b>{found_total}</b> сообщений за 30 дней."
+    if errors:
+        result += "\n\n⚠️ Ошибки:\n" + "\n".join(f"  • {e}" for e in errors[:5])
+    await safe_edit(q, result, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    return STATE_MENU
+
+
+# ═══════════════════════════════════════════════════════════
 #  TELETHON-МОНИТОРИНГ (фоновый поток)
 # ═══════════════════════════════════════════════════════════
 
@@ -976,6 +1132,8 @@ def main():
                 CallbackQueryHandler(cb_add_keywords_start, pattern="^add_keywords$"),
                 CallbackQueryHandler(cb_set_notify, pattern="^set_notify$"),
                 CallbackQueryHandler(cb_my_settings, pattern="^my_settings$"),
+                CallbackQueryHandler(cb_forward_history_start, pattern="^forward_history$"),
+                CallbackQueryHandler(cb_select_acc_history, pattern=r"^select_acc_history:"),
                 CallbackQueryHandler(cb_start_monitor, pattern="^start_monitor$"),
                 CallbackQueryHandler(cb_stop_monitor, pattern="^stop_monitor$"),
                 CallbackQueryHandler(cb_back_menu, pattern="^back_menu$"),
