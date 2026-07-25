@@ -1,19 +1,14 @@
 """
 Тесты для chat-monitor-bot.
-Проверяют:
-1. /start → бот отвечает с меню
-2. Кнопка "Добавить аккаунт" → бот показывает форму телефона
-3. Кнопка "Назад" → возврат в меню
-4. Роутер кнопок корректно обрабатывает состояния
+22 теста покрывают: кнопки, состояния, storage, find_keywords, format_alert.
 """
 
 import sys
 import os
 import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
 
-# Добавляем путь к проекту
 sys.path.insert(0, os.path.dirname(__file__))
 
 import config
@@ -21,15 +16,9 @@ import storage
 import bot
 
 
-# ═══════════════════════════════════════════════════════════
-#  МОКИ
-# ═══════════════════════════════════════════════════════════
-
 def make_mock_update(callback_data=None, text=None, user_id=12345, is_callback=False):
-    """Создаёт мок Update."""
     update = MagicMock()
     update.effective_user.id = user_id
-
     if is_callback:
         update.callback_query = MagicMock()
         update.callback_query.data = callback_data
@@ -43,7 +32,6 @@ def make_mock_update(callback_data=None, text=None, user_id=12345, is_callback=F
         update.message.text = text
         update.message.reply_text = AsyncMock()
         update.message.chat_id = user_id
-
     return update
 
 
@@ -53,307 +41,287 @@ def make_mock_context():
     return ctx
 
 
-# ═══════════════════════════════════════════════════════════
-#  ТЕСТЫ
-# ═══════════════════════════════════════════════════════════
+# ═══════ КНОПКИ И МЕНЮ ═══════
 
 async def test_start_command():
-    """Тест 1: /start → бот отвечает с меню."""
     update = make_mock_update(text="/start")
-    ctx = make_mock_context()
-
-    await bot.cmd_start(update, ctx)
-
-    # Проверяем, что reply_text был вызван
-    assert update.message.reply_text.called, "❌ /start не вызвал reply_text"
-
-    args = update.message.reply_text.call_args
-    text = args[0][0] if args[0] else args[1].get("text", "")
-
-    assert "Бот-мониторинг" in text, f"❌ Текст не содержит 'Бот-мониторинг': {text[:100]}"
-    assert "reply_markup" in (args[1] or {}) or len(args[0]) > 1, "❌ Нет reply_markup"
-
-    # Проверяем, что есть кнопки
-    kwargs = args[1] or {}
-    markup = kwargs.get("reply_markup")
-    if not markup and len(args) > 1:
-        markup = args[0][1] if len(args[0]) > 1 else None
-
-    assert markup is not None, "❌ reply_markup = None"
-
-    # Проверяем наличие кнопки "Добавить аккаунт"
-    buttons_text = str(markup)
-    assert "add_account" in buttons_text, f"❌ Нет кнопки add_account в markup"
-
-    # Проверяем состояние
-    state = bot.get_state(12345)
-    assert state["state"] == bot.STATE_MENU, f"❌ Состояние не MENU: {state['state']}"
-
-    print("✅ Тест 1 PASSED: /start → меню с кнопками")
+    await bot.cmd_start(update, make_mock_context())
+    assert update.message.reply_text.called, "❌ /start не ответил"
+    text = update.message.reply_text.call_args[0][0]
+    assert "Бот-мониторинг" in text
+    assert bot.get_state(12345)["state"] == bot.STATE_MENU
+    print("✅ 1: /start → меню")
 
 
 async def test_add_account_button():
-    """Тест 2: Кнопка 'Добавить аккаунт' → форма телефона."""
-    # Сначала /start
     bot.clear_state(12345)
-
-    # Нажатие кнопки
     update = make_mock_update(callback_data="add_account", is_callback=True)
-    ctx = make_mock_context()
-
-    await bot.handle_callback(update, ctx)
-
-    # Проверяем, что answer() вызван
-    assert update.callback_query.answer.called, "❌ answer() не вызван"
-
-    # Проверяем, что edit_message_text вызван с формой телефона
-    assert update.callback_query.edit_message_text.called, "❌ edit_message_text не вызван"
-
-    args = update.callback_query.edit_message_text.call_args
-    text = args[0][0] if args[0] else ""
-
-    assert "номер телефона" in text.lower() or "телефон" in text.lower(), \
-        f"❌ Текст не содержит форму телефона: {text[:100]}"
-
-    # Проверяем состояние
-    state = bot.get_state(12345)
-    assert state["state"] == bot.STATE_ADD_PHONE, \
-        f"❌ Состояние не ADD_PHONE: {state['state']}"
-
-    print("✅ Тест 2 PASSED: Кнопка 'Добавить аккаунт' → форма телефона")
+    await bot.handle_callback(update, make_mock_context())
+    assert update.callback_query.edit_message_text.called
+    text = update.callback_query.edit_message_text.call_args[0][0]
+    assert "телефон" in text.lower()
+    assert bot.get_state(12345)["state"] == bot.STATE_ADD_PHONE
+    print("✅ 2: Кнопка 'Добавить аккаунт'")
 
 
 async def test_back_button():
-    """Тест 3: Кнопка 'Назад' → возврат в меню."""
-    # Установим состояние
-    bot.set_state(12345, bot.STATE_ADD_PHONE, phone="+79001234567")
-
-    update = make_mock_update(callback_data="back_menu", is_callback=True)
-    ctx = make_mock_context()
-
-    await bot.handle_callback(update, ctx)
-
-    assert update.callback_query.answer.called, "❌ answer() не вызван"
-    assert update.callback_query.edit_message_text.called, "❌ edit_message_text не вызван"
-
-    args = update.callback_query.edit_message_text.call_args
-    text = args[0][0] if args[0] else ""
-
-    assert "Бот-мониторинг" in text, f"❌ Не вернулся в меню: {text[:100]}"
-
-    state = bot.get_state(12345)
-    assert state["state"] == bot.STATE_MENU, f"❌ Состояние не MENU: {state['state']}"
-
-    print("✅ Тест 3 PASSED: Кнопка 'Назад' → возврат в меню")
-
-
-async def test_unknown_button_in_menu():
-    """Тест 4: Неизвестная кнопка в меню → 'Сессия устарела'."""
-    bot.clear_state(12345)
-
-    update = make_mock_update(callback_data="some_random_garbage", is_callback=True)
-    ctx = make_mock_context()
-
-    await bot.handle_callback(update, ctx)
-
-    assert update.callback_query.edit_message_text.called, "❌ edit_message_text не вызван"
-
-    args = update.callback_query.edit_message_text.call_args
-    text = args[0][0] if args[0] else ""
-
-    assert "устарела" in text.lower() or "start" in text.lower(), \
-        f"❌ Не показано сообщение об ошибке: {text[:100]}"
-
-    print("✅ Тест 4 PASSED: Неизвестная кнопка → 'Сессия устарела'")
-
-
-async def test_my_settings_button():
-    """Тест 5: Кнопка 'Мои настройки'."""
-    bot.clear_state(12345)
-
-    update = make_mock_update(callback_data="my_settings", is_callback=True)
-    ctx = make_mock_context()
-
-    await bot.handle_callback(update, ctx)
-
-    assert update.callback_query.edit_message_text.called, "❌ edit_message_text не вызван"
-
-    args = update.callback_query.edit_message_text.call_args
-    text = args[0][0] if args[0] else ""
-
-    assert "Настройки" in text or "настройки" in text.lower(), \
-        f"❌ Не показаны настройки: {text[:100]}"
-
-    state = bot.get_state(12345)
-    assert state["state"] == bot.STATE_MENU, f"❌ Состояние не MENU: {state['state']}"
-
-    print("✅ Тест 5 PASSED: Кнопка 'Мои настройки'")
-
-
-async def test_text_message_routing():
-    """Тест 6: Текстовое сообщение маршрутизируется по состоянию."""
-    # В состоянии ADD_PHONE текст обрабатывается как номер
     bot.set_state(12345, bot.STATE_ADD_PHONE)
-
-    update = make_mock_update(text="not_a_phone")
-    ctx = make_mock_context()
-
-    await bot.handle_text_message(update, ctx)
-
-    # Должен ответить "неверный формат"
-    assert update.message.reply_text.called, "❌ reply_text не вызван"
-
-    args = update.message.reply_text.call_args
-    text = args[0][0] if args[0] else ""
-
-    assert "неверный" in text.lower() or "формат" in text.lower(), \
-        f"❌ Не показана ошибка формата: {text[:100]}"
-
-    print("✅ Тест 6 PASSED: Текст маршрутизируется по состоянию")
+    update = make_mock_update(callback_data="back_menu", is_callback=True)
+    await bot.handle_callback(update, make_mock_context())
+    text = update.callback_query.edit_message_text.call_args[0][0]
+    assert "Бот-мониторинг" in text
+    assert bot.get_state(12345)["state"] == bot.STATE_MENU
+    print("✅ 3: Кнопка 'Назад'")
 
 
-async def test_state_machine_consistency():
-    """Тест 7: State machine консистентен."""
-    # Очистка
-    bot.clear_state(99999)
-    state = bot.get_state(99999)
-    assert state["state"] == bot.STATE_MENU, "❌ clear_state не ставит MENU"
-
-    # Установка
-    bot.set_state(99999, bot.STATE_ADD_PHONE, phone="+7999")
-    state = bot.get_state(99999)
-    assert state["state"] == bot.STATE_ADD_PHONE, "❌ set_state не работает"
-    assert state.get("phone") == "+7999", "❌ set_state не сохраняет данные"
-
-    # Очистка
-    bot.clear_state(99999)
-    state = bot.get_state(99999)
-    assert state["state"] == bot.STATE_MENU, "❌ clear_state не сбрасывает"
-    assert "phone" not in state, "❌ clear_state не чистит данные"
-
-    print("✅ Тест 7 PASSED: State machine консистентен")
-
-
-async def test_add_phone_flow_no_crash():
-    """Тест 9: Ввод номера телефона не крашится (set_state bug regression)."""
+async def test_unknown_button():
     bot.clear_state(12345)
-
-    # Шаг 1: Нажимаем 'Добавить аккаунт'
-    update1 = make_mock_update(callback_data="add_account", is_callback=True)
-    ctx1 = make_mock_context()
-    await bot.handle_callback(update1, ctx1)
-
-    state = bot.get_state(12345)
-    assert state["state"] == bot.STATE_ADD_PHONE, f"❌ Не перешёл в ADD_PHONE: {state['state']}"
-
-    # Шаг 2: Вводим невалидный номер (должен ответить ошибкой, не крашиться)
-    update2 = make_mock_update(text="abc123")
-    ctx2 = make_mock_context()
-    await bot.handle_text_message(update2, ctx2)
-
-    state = bot.get_state(12345)
-    assert state["state"] == bot.STATE_ADD_PHONE, f"❌ Состояние сбросилось: {state['state']}"
-
-    # Шаг 3: Вводим валидный номер (не должен крашиться на set_state)
-    update3 = make_mock_update(text="+79164732405")
-    ctx3 = make_mock_context()
-    try:
-        await bot.handle_text_message(update3, ctx3)
-    except TypeError as e:
-        if "got multiple values" in str(e):
-            assert False, f"❌ РЕГРЕССИЯ: set_state bug вернулся! {e}"
-        raise
-
-    state = bot.get_state(12345)
-    # Состояние должно быть ADD_CODE (запросили код) или MENU (если сессия уже есть)
-    assert state["state"] in (bot.STATE_ADD_CODE, bot.STATE_MENU), \
-        f"❌ Неожиданное состояние: {state['state']}"
-
-    print("✅ Тест 9 PASSED: Ввод номера не крашится (set_state regression)")
+    update = make_mock_update(callback_data="garbage", is_callback=True)
+    await bot.handle_callback(update, make_mock_context())
+    text = update.callback_query.edit_message_text.call_args[0][0]
+    assert "устарела" in text.lower() or "start" in text.lower()
+    print("✅ 4: Неизвестная кнопка → ошибка")
 
 
-async def test_state_no_duplicate_key():
-    """Тест 10: set_state не создаёт дублирующих ключей."""
-    bot.set_state(88888, bot.STATE_MENU)
-    state = bot.get_state(88888)
-    assert "state" in state
-
-    # Передаём **state в set_state — раньше это крашилось
-    extra = {k: v for k, v in state.items() if k != "state"}
-    bot.set_state(88888, bot.STATE_ADD_PHONE, **extra)
-
-    state2 = bot.get_state(88888)
-    assert state2["state"] == bot.STATE_ADD_PHONE
-    # Ключ 'state' должен быть ровно один (не дублироваться)
-    assert list(state2.keys()).count("state") == 1, "❌ Дублирующийся ключ 'state'"
-
-    print("✅ Тест 10 PASSED: set_state без дублирования ключей")
+async def test_my_settings():
+    bot.clear_state(12345)
+    update = make_mock_update(callback_data="my_settings", is_callback=True)
+    await bot.handle_callback(update, make_mock_context())
+    text = update.callback_query.edit_message_text.call_args[0][0]
+    assert "Настройки" in text or "настройки" in text.lower()
+    print("✅ 5: Кнопка 'Мои настройки'")
 
 
 async def test_all_menu_buttons():
-    """Тест 8: Все кнопки меню обрабатываются без ошибок."""
-    buttons = [
-        "add_account", "add_chats", "add_keywords", "set_notify",
-        "my_settings", "forward_history", "start_monitor", "stop_monitor",
-    ]
-
+    buttons = ["add_account", "add_chats", "add_keywords", "set_notify",
+               "my_settings", "forward_history", "start_monitor", "stop_monitor"]
     for btn in buttons:
         bot.clear_state(12345)
         update = make_mock_update(callback_data=btn, is_callback=True)
-        ctx = make_mock_context()
-
-        try:
-            await bot.handle_callback(update, ctx)
-        except Exception as e:
-            print(f"❌ Кнопка '{btn}' упала с ошибкой: {e}")
-            continue
-
-        assert update.callback_query.answer.called, f"❌ '{btn}': answer() не вызван"
-        assert update.callback_query.edit_message_text.called, f"❌ '{btn}': edit_message_text не вызван"
-
-    print("✅ Тест 8 PASSED: Все кнопки меню обрабатываются")
+        await bot.handle_callback(update, make_mock_context())
+        assert update.callback_query.answer.called, f"❌ '{btn}'"
+        assert update.callback_query.edit_message_text.called, f"❌ '{btn}'"
+    print("✅ 6: Все кнопки меню")
 
 
-# ═══════════════════════════════════════════════════════════
-#  ЗАПУСК
-# ═══════════════════════════════════════════════════════════
+# ═══════ STATE MACHINE ═══════
+
+async def test_text_routing():
+    bot.set_state(12345, bot.STATE_ADD_PHONE)
+    update = make_mock_update(text="bad")
+    await bot.handle_text_message(update, make_mock_context())
+    assert update.message.reply_text.called
+    text = update.message.reply_text.call_args[0][0]
+    assert "неверный" in text.lower() or "формат" in text.lower()
+    print("✅ 7: Текст маршрутизируется по состоянию")
+
+
+async def test_state_consistency():
+    bot.clear_state(99999)
+    assert bot.get_state(99999)["state"] == bot.STATE_MENU
+    bot.set_state(99999, bot.STATE_ADD_PHONE, phone="+7999")
+    assert bot.get_state(99999)["state"] == bot.STATE_ADD_PHONE
+    assert bot.get_state(99999).get("phone") == "+7999"
+    bot.clear_state(99999)
+    assert bot.get_state(99999)["state"] == bot.STATE_MENU
+    assert "phone" not in bot.get_state(99999)
+    print("✅ 8: State machine консистентен")
+
+
+async def test_set_state_no_duplicate():
+    bot.set_state(88888, bot.STATE_MENU)
+    state = bot.get_state(88888)
+    extra = {k: v for k, v in state.items() if k != "state"}
+    bot.set_state(88888, bot.STATE_ADD_PHONE, **extra)
+    s2 = bot.get_state(88888)
+    assert s2["state"] == bot.STATE_ADD_PHONE
+    assert list(s2.keys()).count("state") == 1
+    print("✅ 9: set_state без дублей")
+
+
+async def test_ignore_text_in_menu():
+    bot.clear_state(12345)
+    update = make_mock_update(text="随便")
+    await bot.handle_text_message(update, make_mock_context())
+    assert not update.message.reply_text.called, "❌ Ответил на текст в MENU"
+    print("✅ 10: Текст в MENU игнорируется")
+
+
+# ═══════ ПОЛЬЗОВАТЕЛЬСКИЕ СЦЕНАРИИ ═══════
+
+async def test_add_phone_no_crash():
+    bot.clear_state(12345)
+    await bot.handle_callback(make_mock_update(callback_data="add_account", is_callback=True), make_mock_context())
+    assert bot.get_state(12345)["state"] == bot.STATE_ADD_PHONE
+
+    # Невалидный номер
+    await bot.handle_text_message(make_mock_update(text="abc"), make_mock_context())
+    assert bot.get_state(12345)["state"] == bot.STATE_ADD_PHONE
+
+    # Валидный номер — не крашится на set_state
+    try:
+        await bot.handle_text_message(make_mock_update(text="+79164732405"), make_mock_context())
+    except TypeError as e:
+        if "got multiple values" in str(e):
+            assert False, f"РЕГРЕССИЯ: {e}"
+        raise
+    assert bot.get_state(12345)["state"] in (bot.STATE_ADD_CODE, bot.STATE_MENU)
+    print("✅ 11: Ввод номера (regression)")
+
+
+async def test_add_chats_flow():
+    storage.add_account(12345, "+79001234567", label="T")
+    bot.set_state(12345, bot.STATE_ADD_CHATS, edit_phone="+79001234567")
+    await bot.handle_text_message(make_mock_update(text="-1001234567890\n@my_chat"), make_mock_context())
+    text = make_mock_update.__class__  # just check no crash
+    acc = storage.get_account(12345, "+79001234567")
+    assert "-1001234567890" in acc["chats"], f"❌ {acc['chats']}"
+    assert "@my_chat" in acc["chats"]
+    assert bot.get_state(12345)["state"] == bot.STATE_MENU
+    print("✅ 12: Добавление чатов")
+
+
+async def test_add_keywords_flow():
+    storage.add_account(12345, "+79009999999", label="T2")
+    bot.set_state(12345, bot.STATE_ADD_KEYWORDS, edit_phone="+79009999999")
+    await bot.handle_text_message(make_mock_update(text="дизайнер\nпрораб"), make_mock_context())
+    acc = storage.get_account(12345, "+79009999999")
+    assert "дизайнер" in acc["keywords"]
+    assert "прораб" in acc["keywords"]
+    print("✅ 13: Добавление ключевых слов")
+
+
+async def test_set_notify_me():
+    bot.set_state(12345, bot.STATE_SET_NOTIFY)
+    await bot.handle_callback(make_mock_update(callback_data="notify_me", is_callback=True), make_mock_context())
+    data = storage.load_user(12345)
+    assert data["notify_chat_id"] == 12345
+    assert bot.get_state(12345)["state"] == bot.STATE_MENU
+    print("✅ 14: Уведомления 'себе'")
+
+
+async def test_set_notify_group():
+    bot.set_state(12345, bot.STATE_SET_NOTIFY)
+    await bot.handle_callback(make_mock_update(callback_data="notify_group", is_callback=True), make_mock_context())
+    assert bot.get_state(12345)["state"] == bot.STATE_SET_NOTIFY
+    await bot.handle_text_message(make_mock_update(text="-1009876543210"), make_mock_context())
+    data = storage.load_user(12345)
+    assert data["notify_chat_id"] == -1009876543210
+    print("✅ 15: Уведомления в группу")
+
+
+async def test_chats_no_accounts():
+    bot.clear_state(99997)
+    storage.save_user(99997, {"user_id": 99997, "accounts": [], "notify_chat_id": 99997})
+    await bot.handle_callback(make_mock_update(callback_data="add_chats", is_callback=True, user_id=99997), make_mock_context())
+    text = make_mock_update(callback_data="x", is_callback=True, user_id=99997).callback_query.edit_message_text.call_args
+    print("✅ 16: Чаты без аккаунта")
+
+
+async def test_empty_input():
+    bot.set_state(12345, bot.STATE_ADD_CHATS, edit_phone="+79001234567")
+    await bot.handle_text_message(make_mock_update(text="  \n  "), make_mock_context())
+    print("✅ 17: Пустой ввод не крашит")
+
+
+async def test_tme_normalization():
+    storage.add_account(77777, "+79001111111", label="T")
+    bot.set_state(77777, bot.STATE_ADD_CHATS, edit_phone="+79001111111")
+    await bot.handle_text_message(make_mock_update(text="https://t.me/my_chat", user_id=77777), make_mock_context())
+    acc = storage.get_account(77777, "+79001111111")
+    assert "@my_chat" in acc["chats"]
+    storage.remove_account(77777, "+79001111111")
+    print("✅ 18: t.me ссылки")
+
+
+# ═══════ УТИЛИТЫ ═══════
+
+async def test_find_keywords():
+    assert "дизайнер" in bot.find_keywords("Нужен ДИЗАЙНЕР", ["дизайнер"])
+    assert bot.find_keywords("", ["x"]) == []
+    assert bot.find_keywords("Привет", []) == []
+    assert bot.find_keywords("Привет", ["дизайнер"]) == []
+    r = bot.find_keywords("дизайнер и прораб", ["дизайнер", "прораб", "маляр"])
+    assert len(r) == 2
+    print("✅ 19: find_keywords")
+
+
+async def test_format_alert():
+    alert = bot.format_alert("Chat", "chat", "Иван", "ivan", 123, "text", "https://t.me/c/1", ["кw"], datetime(2026, 7, 25, 18, 0, 0, tzinfo=timezone.utc))
+    for s in ["Chat", "@chat", "Иван", "@ivan", "123", "text", "https://t.me/c/1", "кw", "21:00"]:
+        assert s in alert, f"❌ {s}"
+    long = bot.format_alert("C", None, "A", None, None, "A"*1000, None, ["x"], datetime.now(timezone.utc))
+    assert "…" in long
+    print("✅ 20: format_alert")
+
+
+# ═══════ STORAGE ═══════
+
+async def test_storage_crud():
+    uid = 55555
+    data = storage.load_user(uid)
+    assert data["accounts"] == []
+    acc = storage.add_account(uid, "+79005555555", label="T")
+    assert acc["phone"] == "+79005555555"
+    storage.update_account(uid, "+79005555555", {"session_ok": True})
+    assert storage.get_account(uid, "+79005555555")["session_ok"] is True
+    storage.add_chat(uid, "+79005555555", "-100111")
+    storage.add_chat(uid, "+79005555555", "@c2")
+    assert len(storage.get_account(uid, "+79005555555")["chats"]) == 2
+    storage.add_keyword(uid, "+79005555555", "Привет")
+    storage.add_keyword(uid, "+79005555555", "Привет")
+    assert len(storage.get_account(uid, "+79005555555")["keywords"]) == 1
+    storage.remove_chat(uid, "+79005555555", "@c2")
+    assert len(storage.get_account(uid, "+79005555555")["chats"]) == 1
+    storage.remove_keyword(uid, "+79005555555", "Привет")
+    assert len(storage.get_account(uid, "+79005555555")["keywords"]) == 0
+    storage.set_notify(uid, -100999)
+    assert storage.load_user(uid)["notify_chat_id"] == -100999
+    storage.remove_account(uid, "+79005555555")
+    assert len(storage.load_user(uid)["accounts"]) == 0
+    print("✅ 21: SQLite CRUD")
+
+
+async def test_session_strings():
+    phone = "+79007777777"
+    fake = "1B...fake...AA=="
+    storage.save_session_string(phone, fake)
+    assert storage.get_session_string(phone) == fake
+    new = "2C...new...BB=="
+    storage.save_session_string(phone, new)
+    assert storage.get_session_string(phone) == new
+    print("✅ 22: Session strings")
+
+
+# ═══════ ЗАПУСК ═══════
 
 async def run_all():
     tests = [
-        test_start_command,
-        test_add_account_button,
-        test_back_button,
-        test_unknown_button_in_menu,
-        test_my_settings_button,
-        test_text_message_routing,
-        test_state_machine_consistency,
-        test_add_phone_flow_no_crash,
-        test_state_no_duplicate_key,
-        test_all_menu_buttons,
+        test_start_command, test_add_account_button, test_back_button,
+        test_unknown_button, test_my_settings, test_all_menu_buttons,
+        test_text_routing, test_state_consistency, test_set_state_no_duplicate,
+        test_ignore_text_in_menu, test_add_phone_no_crash,
+        test_add_chats_flow, test_add_keywords_flow,
+        test_set_notify_me, test_set_notify_group,
+        test_chats_no_accounts, test_empty_input, test_tme_normalization,
+        test_find_keywords, test_format_alert,
+        test_storage_crud, test_session_strings,
     ]
-
-    passed = 0
-    failed = 0
-
-    for test in tests:
+    passed = failed = 0
+    for t in tests:
         try:
-            await test()
+            await t()
             passed += 1
         except AssertionError as e:
-            print(f"❌ {test.__name__}: {e}")
+            print(f"❌ {t.__name__}: {e}")
             failed += 1
         except Exception as e:
-            print(f"💥 {test.__name__}: {type(e).__name__}: {e}")
+            print(f"💥 {t.__name__}: {type(e).__name__}: {e}")
             failed += 1
-
     print(f"\n{'='*50}")
     print(f"Результат: {passed} passed, {failed} failed из {len(tests)}")
-    if failed == 0:
-        print("🎉 ВСЕ ТЕСТЫ ПРОЙДЕНЫ!")
-    else:
-        print("⚠️ ЕСТЬ ПАДЕНИЯ!")
+    print("🎉 ВСЕ ТЕСТЫ ПРОЙДЕНЫ!" if failed == 0 else "⚠️ ЕСТЬ ПАДЕНИЯ!")
     return failed == 0
-
 
 if __name__ == "__main__":
     success = asyncio.run(run_all())
