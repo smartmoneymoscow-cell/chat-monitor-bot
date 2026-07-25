@@ -507,9 +507,14 @@ async def msg_add_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = update.message.text.strip().split("\n")
     added = []
+    skipped = []
     for line in lines:
         line = line.strip()
         if not line:
+            continue
+        # Invite-ссылки не подходят для мониторинга
+        if "+" in line.split("t.me/")[-1] if "t.me/" in line else False:
+            skipped.append(line)
             continue
         chat_id = line
         if "t.me/" in line:
@@ -518,10 +523,24 @@ async def msg_add_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         added.append(chat_id)
 
     clear_state(user_id)
+
+    # Формируем ответ
+    parts = []
     if added:
+        parts.append(f"✅ Добавлено чатов: <b>{len(added)}</b>")
+        parts.extend(f"  • <code>{c}</code>" for c in added)
+    if skipped:
+        parts.append("")
+        parts.append("⚠️ <b>Invite-ссылки не подходят для мониторинга:</b>")
+        for s in skipped:
+            parts.append(f"  • <code>{s}</code>")
+        parts.append("")
+        parts.append("📌 Введите числовой ID чата (<code>-100...</code>) или <code>@username</code>.")
+        parts.append("Узнать ID: переслать сообщение из чата боту @userinfobot")
+
+    if parts:
         await update.message.reply_text(
-            f"✅ Добавлено чатов: <b>{len(added)}</b>\n" +
-            "\n".join(f"  • <code>{c}</code>" for c in added),
+            "\n".join(parts),
             parse_mode="HTML", reply_markup=main_menu_keyboard(),
         )
     else:

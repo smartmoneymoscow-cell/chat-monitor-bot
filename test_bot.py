@@ -218,6 +218,23 @@ async def test_chats_no_accounts():
     print("✅ 16: Чаты без аккаунта")
 
 
+async def test_invite_link_rejected():
+    """Тест: invite-ссылка не крашит, даёт понятный ответ."""
+    storage.add_account(12345, "+79001234567", label="T")
+    bot.set_state(12345, bot.STATE_ADD_CHATS, edit_phone="+79001234567")
+    update = make_mock_update(text="https://t.me/+1Lomw30tNkxIMTFi")
+    await bot.handle_text_message(update, make_mock_context())
+    args = update.message.reply_text.call_args
+    text = args[0][0] if args[0] else ""
+    assert "Invite" in text or "invite" in text.lower() or "не подходят" in text.lower(), \
+        f"❌ Не объяснило про invite-ссылки: {text[:150]}"
+    # Чат не должен добавиться
+    acc = storage.get_account(12345, "+79001234567")
+    has_invite = any("+" in c for c in acc["chats"])
+    assert not has_invite, f"❌ Invite-ссылка попала в чаты: {acc['chats']}"
+    print("✅ 18b: Invite-ссылка отклонена")
+
+
 async def test_empty_input():
     bot.set_state(12345, bot.STATE_ADD_CHATS, edit_phone="+79001234567")
     await bot.handle_text_message(make_mock_update(text="  \n  "), make_mock_context())
@@ -302,6 +319,7 @@ async def run_all():
         test_text_routing, test_state_consistency, test_set_state_no_duplicate,
         test_ignore_text_in_menu, test_add_phone_no_crash,
         test_add_chats_flow, test_add_keywords_flow,
+        test_invite_link_rejected,
         test_set_notify_me, test_set_notify_group,
         test_chats_no_accounts, test_empty_input, test_tme_normalization,
         test_find_keywords, test_format_alert,
