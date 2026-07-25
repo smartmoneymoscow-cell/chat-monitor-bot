@@ -234,6 +234,62 @@ async def test_state_machine_consistency():
     print("✅ Тест 7 PASSED: State machine консистентен")
 
 
+async def test_add_phone_flow_no_crash():
+    """Тест 9: Ввод номера телефона не крашится (set_state bug regression)."""
+    bot.clear_state(12345)
+
+    # Шаг 1: Нажимаем 'Добавить аккаунт'
+    update1 = make_mock_update(callback_data="add_account", is_callback=True)
+    ctx1 = make_mock_context()
+    await bot.handle_callback(update1, ctx1)
+
+    state = bot.get_state(12345)
+    assert state["state"] == bot.STATE_ADD_PHONE, f"❌ Не перешёл в ADD_PHONE: {state['state']}"
+
+    # Шаг 2: Вводим невалидный номер (должен ответить ошибкой, не крашиться)
+    update2 = make_mock_update(text="abc123")
+    ctx2 = make_mock_context()
+    await bot.handle_text_message(update2, ctx2)
+
+    state = bot.get_state(12345)
+    assert state["state"] == bot.STATE_ADD_PHONE, f"❌ Состояние сбросилось: {state['state']}"
+
+    # Шаг 3: Вводим валидный номер (не должен крашиться на set_state)
+    update3 = make_mock_update(text="+79164732405")
+    ctx3 = make_mock_context()
+    try:
+        await bot.handle_text_message(update3, ctx3)
+    except TypeError as e:
+        if "got multiple values" in str(e):
+            assert False, f"❌ РЕГРЕССИЯ: set_state bug вернулся! {e}"
+        raise
+
+    state = bot.get_state(12345)
+    # Состояние должно быть ADD_CODE (запросили код) или MENU (если сессия уже есть)
+    assert state["state"] in (bot.STATE_ADD_CODE, bot.STATE_MENU), \
+        f"❌ Неожиданное состояние: {state['state']}"
+
+    print("✅ Тест 9 PASSED: Ввод номера не крашится (set_state regression)")
+
+
+async def test_state_no_duplicate_key():
+    """Тест 10: set_state не создаёт дублирующих ключей."""
+    bot.set_state(88888, bot.STATE_MENU)
+    state = bot.get_state(88888)
+    assert "state" in state
+
+    # Передаём **state в set_state — раньше это крашилось
+    extra = {k: v for k, v in state.items() if k != "state"}
+    bot.set_state(88888, bot.STATE_ADD_PHONE, **extra)
+
+    state2 = bot.get_state(88888)
+    assert state2["state"] == bot.STATE_ADD_PHONE
+    # Ключ 'state' должен быть ровно один (не дублироваться)
+    assert list(state2.keys()).count("state") == 1, "❌ Дублирующийся ключ 'state'"
+
+    print("✅ Тест 10 PASSED: set_state без дублирования ключей")
+
+
 async def test_all_menu_buttons():
     """Тест 8: Все кнопки меню обрабатываются без ошибок."""
     buttons = [
@@ -271,6 +327,8 @@ async def run_all():
         test_my_settings_button,
         test_text_message_routing,
         test_state_machine_consistency,
+        test_add_phone_flow_no_crash,
+        test_state_no_duplicate_key,
         test_all_menu_buttons,
     ]
 
