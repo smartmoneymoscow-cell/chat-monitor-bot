@@ -359,7 +359,8 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["tc_session_string"] = tc.session.save()
         await tc.disconnect()
 
-        set_state(user_id, STATE_ADD_CODE, **state)
+        extra = {k: v for k, v in state.items() if k != "state"}
+        set_state(user_id, STATE_ADD_CODE, **extra)
         await update.message.reply_text(
             "📩 Код подтверждения отправлен в Telegram.\nВведите код:",
             reply_markup=back_keyboard(),
