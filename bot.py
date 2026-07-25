@@ -51,8 +51,19 @@ if SENTRY_DSN:
         traces_sample_rate=1.0,
         environment=os.environ.get("RENDER_SERVICE_NAME", "local"),
         release=os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        before_send=lambda event, hint: _sentry_before_send(event, hint),
     )
     print(f"✅ Sentry initialized", flush=True)
+
+
+def _sentry_before_send(event, hint):
+    """Фильтрует и обогащает события перед отправкой в Sentry."""
+    # Добавляем тег с типом ошибки
+    if hint and "exc_info" in hint:
+        exc_type = hint["exc_info"][0]
+        if exc_type:
+            event.setdefault("tags", {})["error_type"] = exc_type.__name__
+    return event
 
 # ── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -166,6 +177,8 @@ async def safe_edit(query, text, **kwargs):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     log.info(f"[/start] user={user_id}")
+    if SENTRY_DSN:
+        sentry_sdk.add_breadcrumb(category="command", message=f"user={user_id} /start", level="info")
     clear_state(user_id)
 
     text = (
@@ -204,6 +217,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = q.data
     state = get_state(user_id)
+
+    # Sentry breadcrumb — действие пользователя
+    if SENTRY_DSN:
+        sentry_sdk.add_breadcrumb(
+            category="callback",
+            message=f"user={user_id} data={data} state={state['state']}",
+            level="info",
+        )
 
     log.info(f"Callback: user={user_id} data={data} state={state['state']}")
 
@@ -973,6 +994,16 @@ async def telethon_client_task(phone, monitor_cfg, loop):
         await tc.run_until_disconnected()
     except Exception as e:
         log.error(f"Ошибка Telethon {phone}: {e}")
+        if SENTRY_DSN:
+            sentry_sdk.add_breadcrumb(
+                category="telethon",
+                message=f"Telethon crashed: {phone}",
+                level="error",
+            )
+            with sentry_sdk.new_scope() as scope:
+                scope.set_tag("component", "telethon")
+                scope.set_tag("phone", phone)
+                sentry_sdk.capture_exception(e)
     finally:
         try:
             await tc.disconnect()
@@ -991,8 +1022,23 @@ def telethon_worker():
             log.info("Нет активных мониторингов")
             return
         tasks = [telethon_client_task(m["phone"], m, _telethon_loop) for m in monitors]
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _telethon_loop.run_until_complete(run_all())
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                log.error(f"Telethon task {monitors[i]['phone']} failed: {result}")
+                if SENTRY_DSN:
+                    with sentry_sdk.new_scope() as scope:
+                        scope.set_tag("component", "telethon_worker")
+                        scope.set_tag("phone", monitors[i]['phone'])
+                        sentry_sdk.capture_exception(result)
+    try:
+        _telethon_loop.run_until_complete(run_all())
+    except Exception as e:
+        log.error(f"Telethon worker crashed: {e}", exc_info=True)
+        if SENTRY_DSN:
+            with sentry_sdk.new_scope() as scope:
+                scope.set_tag("component", "telethon_worker")
+                sentry_sdk.capture_exception(e)
 
 
 def restart_telethon_monitor():
@@ -1078,7 +1124,14 @@ def main():
     async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Exception while handling an update:", exc_info=ctx.error)
         if SENTRY_DSN:
-            sentry_sdk.capture_exception(ctx.error)
+            # Привязываем user_id к ошибке
+            with sentry_sdk.new_scope() as scope:
+                if isinstance(update, Update) and update.effective_user:
+                    scope.set_user({"id": update.effective_user.id})
+                    scope.set_tag("user_id", str(update.effective_user.id))
+                if isinstance(update, Update) and update.callback_query:
+                    scope.set_tag("callback_data", update.callback_query.data or "")
+                sentry_sdk.capture_exception(ctx.error)
         # Try to notify user
         if isinstance(update, Update) and update.effective_message:
             try:
@@ -1104,6 +1157,13 @@ async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Маршрутизатор текстовых сообщений по состоянию."""
     user_id = update.effective_user.id
     state = get_state(user_id)
+
+    if SENTRY_DSN:
+        sentry_sdk.add_breadcrumb(
+            category="text_message",
+            message=f"user={user_id} state={state['state']}",
+            level="info",
+        )
 
     if state["state"] == STATE_ADD_PHONE:
         await msg_add_phone(update, ctx)
