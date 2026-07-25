@@ -485,7 +485,14 @@ async def msg_add_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_add_chats_start(q, user_id: int):
     data = storage.load_user(user_id)
     if not data["accounts"]:
-        await safe_edit(q, "❌ Сначала добавьте аккаунт.", reply_markup=main_menu_keyboard())
+        await safe_edit(
+            q,
+            "💬 <b>Добавление чатов</b>\n\n"
+            "❌ У вас нет добавленных аккаунтов.\n"
+            "Сначала нажмите \"📱 Добавить аккаунт\".",
+            parse_mode="HTML",
+            reply_markup=back_keyboard(),
+        )
         return
     await safe_edit(
         q,
@@ -571,7 +578,14 @@ async def msg_add_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_add_keywords_start(q, user_id: int):
     data = storage.load_user(user_id)
     if not data["accounts"]:
-        await safe_edit(q, "❌ Сначала добавьте аккаунт.", reply_markup=main_menu_keyboard())
+        await safe_edit(
+            q,
+            "🔑 <b>Добавление ключевых слов</b>\n\n"
+            "❌ У вас нет добавленных аккаунтов.\n"
+            "Сначала нажмите \"📱 Добавить аккаунт\".",
+            parse_mode="HTML",
+            reply_markup=back_keyboard(),
+        )
         return
     await safe_edit(
         q,
