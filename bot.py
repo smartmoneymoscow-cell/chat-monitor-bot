@@ -149,6 +149,7 @@ async def safe_edit(query, text, **kwargs):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    log.info(f"[/start] user={user_id}")
     clear_state(user_id)
 
     text = (
@@ -1018,6 +1019,20 @@ def main():
 
     # Все callback query — единый обработчик
     app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # ── Error handler ──
+    async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        log.error("Exception while handling an update:", exc_info=ctx.error)
+        # Try to notify user
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ Произошла ошибка. Попробуйте /start",
+                )
+            except Exception:
+                pass
+
+    app.add_error_handler(error_handler)
 
     log.info("🚀 Бот запущен!")
     app.run_polling(drop_pending_updates=True)
