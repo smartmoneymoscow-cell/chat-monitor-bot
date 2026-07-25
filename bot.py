@@ -19,6 +19,7 @@ import asyncio
 import logging
 import threading
 import time
+import urllib.request
 from datetime import datetime, timezone, timedelta
 
 from telegram import (
@@ -1026,6 +1027,23 @@ def main():
             log.error(f"Telethon start failed: {e}", exc_info=True)
             print(f"❌ Telethon failed: {e}", flush=True)
 
+        # Keep-alive ping чтобы Render Free не засыпал
+        def _keep_alive():
+            time.sleep(60)
+            render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+            if not render_url:
+                render_url = f"https://{os.environ.get('RENDER_SERVICE_NAME', 'nedvig-2')}.onrender.com"
+            while True:
+                try:
+                    urllib.request.urlopen(render_url + "/", timeout=10)
+                    log.info("💚 Keep-alive ping OK")
+                except Exception as e:
+                    log.warning(f"⚠️ Keep-alive ping failed: {e}")
+                time.sleep(300)  # каждые 5 минут
+
+        threading.Thread(target=_keep_alive, daemon=True).start()
+        log.info("🔄 Keep-alive ping запущен")
+
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
@@ -1045,7 +1063,8 @@ def main():
     # ── Error handler ──
     async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Exception while handling an update:", exc_info=ctx.error)
-        sentry_sdk.capture_exception(ctx.error)
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(ctx.error)
         # Try to notify user
         if isinstance(update, Update) and update.effective_message:
             try:
