@@ -41,6 +41,18 @@ import config
 from healthcheck import start_health_server
 import storage
 
+# ── Sentry ──────────────────────────────────────────────────
+import sentry_sdk
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=1.0,
+        environment=os.environ.get("RENDER_SERVICE_NAME", "local"),
+        release=os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+    )
+    print(f"✅ Sentry initialized", flush=True)
+
 # ── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -1033,6 +1045,7 @@ def main():
     # ── Error handler ──
     async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Exception while handling an update:", exc_info=ctx.error)
+        sentry_sdk.capture_exception(ctx.error)
         # Try to notify user
         if isinstance(update, Update) and update.effective_message:
             try:
