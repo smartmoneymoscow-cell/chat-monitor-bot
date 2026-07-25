@@ -513,8 +513,16 @@ async def msg_add_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  4. КУДА СЛАТЬ УВЕДОМЛЕНИЯ
 # ═══════════════════════════════════════════════════════════
 
+def notify_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📩 Мне в ЛС", callback_data="notify_me")],
+        [InlineKeyboardButton("👥 В группу / канал", callback_data="notify_group")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_menu")],
+    ])
+
+
 async def cb_set_notify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Запрос chat_id для уведомлений."""
+    """Выбор способа уведомлений."""
     q = update.callback_query
     await q.answer()
     user_id = update.effective_user.id
@@ -526,11 +534,44 @@ async def cb_set_notify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q,
         f"🔔 <b>Куда слать уведомления</b>\n\n"
         f"Текущий получатель: <code>{current}</code>\n\n"
-        "Отправьте:\n"
-        "• <code>me</code> — чтобы слать себе (в ЛС боту)\n"
-        "• Числовой ID группы/канала\n"
-        "• <code>@username</code> канала\n\n"
-        "Узнать ID: перешлите сообщение из чата в @userinfobot",
+        "<b>📩 Мне в ЛС</b> — уведомления придут вам лично в диалог с ботом. "
+        "Удобно, если мониторите для себя.\n\n"
+        "<b>👥 В группу / канал</b> — уведомления придут в указанный чат. "
+        "Нужен числовой ID группы или канала (узнать можно, переслав сообщение в @userinfobot).",
+        parse_mode="HTML",
+        reply_markup=notify_keyboard(),
+    )
+    return STATE_SET_NOTIFY
+
+
+async def cb_notify_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Установить уведомления себе в ЛС."""
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+
+    storage.set_notify(user_id, user_id)
+    await safe_edit(
+        q,
+        f"✅ Уведомления будут приходить вам в ЛС (ID: <code>{user_id}</code>)",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
+    return STATE_MENU
+
+
+async def cb_notify_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Запрос ID группы/канала."""
+    q = update.callback_query
+    await q.answer()
+    await safe_edit(
+        q,
+        "👥 <b>Уведомления в группу / канал</b>\n\n"
+        "Отправьте числовой ID группы или канала.\n\n"
+        "<b>Как узнать ID:</b>\n"
+        "1. Перешлите любое сообщение из чата боту @userinfobot\n"
+        "2. Он ответит с числовой ID этого чата\n\n"
+        "Пример: <code>-1001234567890</code>",
         parse_mode="HTML",
         reply_markup=back_keyboard(),
     )
@@ -962,8 +1003,10 @@ def main():
                 CallbackQueryHandler(cb_back_menu, pattern="^back_menu$"),
             ],
             STATE_SET_NOTIFY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_set_notify),
+                CallbackQueryHandler(cb_notify_me, pattern="^notify_me$"),
+                CallbackQueryHandler(cb_notify_group, pattern="^notify_group$"),
                 CallbackQueryHandler(cb_back_menu, pattern="^back_menu$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_set_notify),
             ],
         },
         fallbacks=[
