@@ -2,13 +2,13 @@
 Telegram-бот с inline-меню для настройки мониторинга чатов.
 
 Архитектура:
-  - python-telegram-bot — интерфейс (меню, кнопки)
-  - Telethon — мониторинг чатов (asyncio tasks в общем event loop)
-  - SQLite или JSON — хранение настроек каждого пользователя
+  - python-telegram-bot — интерфейс (меню, кнопки) — основной event loop
+  - Telethon — мониторинг чатов — ОТДЕЛЬНЫЙ поток с отдельным event loop
+  - SQLite — хранение настроек и Telethon-сессий (персистентно на Render)
 
 Запуск:
   1. Задайте переменные окружения BOT_TOKEN, TELETHON_API_ID, TELETHON_API_HASH
-  2. pip install telethon python-telegram-bot
+  2. pip install telethon python-telegram-bot pysocks
   3. python3 bot.py
 """
 
@@ -17,6 +17,7 @@ import re
 import sys
 import asyncio
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 
 from telegram import (
@@ -60,9 +61,11 @@ log = logging.getLogger("bot")
 ) = range(8)
 
 # ── Глобальные объекты ──────────────────────────────────────
-_telethon_tasks: dict[str, asyncio.Task] = {}      # phone → Task
 _telethon_clients: dict[str, TelegramClient] = {}   # phone → client
+_telethon_loop: asyncio.AbstractEventLoop | None = None
+_telethon_thread: threading.Thread | None = None
 _bot_app: Application | None = None
+_bot_loop: asyncio.AbstractEventLoop | None = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -193,7 +196,7 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["phone"] = phone
 
-    # Проверяем, есть ли уже сессия (в БД или файле)
+    # Проверяем, есть ли уже сессия в БД
     session_string = storage.get_session_string(phone)
     if session_string:
         try:
@@ -204,7 +207,7 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await tc.connect()
             if await tc.is_user_authorized():
                 me = await tc.get_me()
-                # Обновляем строку сессии (может измениться)
+                # Обновляем строку сессии
                 new_session = tc.session.save()
                 storage.save_session_string(phone, new_session)
                 await tc.disconnect()
@@ -230,7 +233,6 @@ async def msg_add_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await tc.connect()
         sent = await tc.send_code_request(phone)
         ctx.user_data["phone_code_hash"] = sent.phone_code_hash
-        # Сохраняем строку сессии во временное хранилище
         ctx.user_data["tc_session_string"] = tc.session.save()
         await tc.disconnect()
 
@@ -272,12 +274,10 @@ async def msg_add_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await tc.sign_in(phone, code, phone_code_hash=phone_code_hash)
         me = await tc.get_me()
 
-        # Сохраняем строку сессии в БД
         final_session = tc.session.save()
         storage.save_session_string(phone, final_session)
         await tc.disconnect()
 
-        # Сохраняем аккаунт
         storage.add_account(update.effective_user.id, phone, label=me.first_name or phone)
         storage.update_account(update.effective_user.id, phone, {"session_ok": True})
 
@@ -701,8 +701,8 @@ async def cb_start_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             acc["active"] = True
     storage.save_user(user_id, data)
 
-    # Перезапускаем Telethon-мониторинг (async)
-    await restart_telethon_monitor()
+    # Перезапускаем Telethon-мониторинг
+    restart_telethon_monitor()
 
     text = "✅ <b>Мониторинг запущен!</b>\n\n"
     for acc in ready:
@@ -727,7 +727,7 @@ async def cb_stop_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         acc["active"] = False
     storage.save_user(user_id, data)
 
-    await stop_telethon_monitor()
+    restart_telethon_monitor()
 
     await safe_edit(
         q,
@@ -892,7 +892,7 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════
-#  TELETHON-МОНИТОРИНГ (asyncio tasks, ОДИН event loop)
+#  TELETHON-МОНИТОРИНГ (отдельный поток с отдельным event loop)
 # ═══════════════════════════════════════════════════════════
 
 def find_keywords(text: str, keywords: list[str]) -> list[str]:
@@ -903,8 +903,29 @@ def find_keywords(text: str, keywords: list[str]) -> list[str]:
     return [kw for kw in keywords if kw.lower() in text_lower]
 
 
-async def forward_alert(
-    notify_chat_id: int,
+def send_alert_sync(bot_token: str, notify_chat_id: int, text: str):
+    """Синхронная отправка уведомления через requests (из Telethon-потока)."""
+    import urllib.request
+    import json as _json
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = _json.dumps({
+        "chat_id": notify_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                log.error(f"Ошибка отправки уведомления: HTTP {resp.status}")
+    except Exception as e:
+        log.error(f"Ошибка отправки уведомления → {notify_chat_id}: {e}")
+
+
+def format_alert(
     chat_title: str,
     chat_username: str | None,
     author_name: str,
@@ -914,13 +935,8 @@ async def forward_alert(
     msg_link: str | None,
     matched_keywords: list[str],
     msg_date: datetime,
-):
-    """Отправляет уведомление через Telegram Bot API."""
-    global _bot_app
-    if not _bot_app:
-        log.error("forward_alert: _bot_app не инициализирован")
-        return
-
+) -> str:
+    """Формирует текст уведомления."""
     moscow_tz = timezone(timedelta(hours=3))
     time_str = msg_date.astimezone(moscow_tz).strftime("%d.%m.%Y %H:%M MSK")
 
@@ -948,21 +964,11 @@ async def forward_alert(
 
     lines.extend(["", "📝 <b>Текст:</b>", f"<blockquote>{text_preview}</blockquote>"])
 
-    try:
-        await _bot_app.bot.send_message(
-            chat_id=notify_chat_id,
-            text="\n".join(lines),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        log.error(f"Ошибка отправки уведомления → {notify_chat_id}: {e}")
+    return "\n".join(lines)
 
 
-async def telethon_client_task(phone: str, monitor_cfg: dict):
-    """Запускает Telethon-клиент для одного аккаунта (asyncio task)."""
-    global _bot_app
-
+async def telethon_client_task(phone: str, monitor_cfg: dict, loop: asyncio.AbstractEventLoop):
+    """Запускает Telethon-клиент для одного аккаунта (в отдельном потоке)."""
     session_string = storage.get_session_string(phone)
     if not session_string:
         log.warning(f"Нет сессии для {phone}, пропускаем")
@@ -984,6 +990,7 @@ async def telethon_client_task(phone: str, monitor_cfg: dict):
         chats = monitor_cfg["chats"]
         keywords = monitor_cfg["keywords"]
         notify_id = monitor_cfg["notify_chat_id"]
+        bot_token = config.BOT_TOKEN
 
         # Нормализуем ID чатов
         resolved_chats = set()
@@ -1029,8 +1036,7 @@ async def telethon_client_task(phone: str, monitor_cfg: dict):
                         raw = raw[4:]
                     msg_link = f"https://t.me/c/{raw}/{event.message.id}"
 
-                await forward_alert(
-                    notify_chat_id=notify_id,
+                alert_text = format_alert(
                     chat_title=chat_title,
                     chat_username=chat_username,
                     author_name=author_name,
@@ -1041,6 +1047,9 @@ async def telethon_client_task(phone: str, monitor_cfg: dict):
                     matched_keywords=found,
                     msg_date=event.message.date,
                 )
+
+                # Отправляем через requests (синхронно, из Telethon-потока)
+                send_alert_sync(bot_token, notify_id, alert_text)
                 log.info(f"✅ [{phone}] {chat_title}: {found}")
 
             except Exception as e:
@@ -1057,53 +1066,49 @@ async def telethon_client_task(phone: str, monitor_cfg: dict):
         except Exception:
             pass
         _telethon_clients.pop(phone, None)
-        _telethon_tasks.pop(phone, None)
 
 
-async def restart_telethon_monitor():
-    """Перезапускает Telethon-мониторинг (async)."""
-    # Останавливаем старые задачи
-    for phone, task in list(_telethon_tasks.items()):
-        task.cancel()
-        log.info(f"Остановлен мониторинг: {phone}")
-    _telethon_tasks.clear()
+def telethon_worker():
+    """Фоновый поток: запускает все Telethon-клиенты."""
+    global _telethon_loop
+    _telethon_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_telethon_loop)
 
-    # Закрываем старых клиентов
+    async def run_all():
+        monitors = storage.get_all_active_monitors()
+        if not monitors:
+            log.info("Нет активных мониторингов")
+            return
+
+        tasks = []
+        for m in monitors:
+            log.info(f"Запуск мониторинга: {m['phone']} → {m['chats']}")
+            tasks.append(telethon_client_task(m["phone"], m, _telethon_loop))
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    _telethon_loop.run_until_complete(run_all())
+
+
+def restart_telethon_monitor():
+    """Перезапускает Telethon-мониторинг (синхронно, из bot-потока)."""
+    global _telethon_thread, _telethon_loop
+
+    # Останавливаем старых клиентов
     for phone, tc in list(_telethon_clients.items()):
         try:
-            await tc.disconnect()
+            if _telethon_loop and _telethon_loop.is_running():
+                asyncio.run_coroutine_threadsafe(tc.disconnect(), _telethon_loop)
         except Exception:
             pass
     _telethon_clients.clear()
 
-    # Запускаем новые задачи
-    monitors = storage.get_all_active_monitors()
-    if not monitors:
-        log.info("Нет активных мониторингов")
-        return
-
-    for m in monitors:
-        log.info(f"Запуск мониторинга: {m['phone']} → {m['chats']}")
-        task = asyncio.create_task(telethon_client_task(m["phone"], m))
-        _telethon_tasks[m["phone"]] = task
-
+    # Запускаем новый поток
+    _telethon_thread = threading.Thread(
+        target=telethon_worker, daemon=True,
+    )
+    _telethon_thread.start()
     log.info("🔄 Telethon-мониторинг перезапущен")
-
-
-async def stop_telethon_monitor():
-    """Останавливает все Telethon-клиенты."""
-    for phone, task in list(_telethon_tasks.items()):
-        task.cancel()
-        log.info(f"Остановлен мониторинг: {phone}")
-    _telethon_tasks.clear()
-
-    for phone, tc in list(_telethon_clients.items()):
-        try:
-            await tc.disconnect()
-        except Exception:
-            pass
-    _telethon_clients.clear()
-    log.info("⏹ Все Telethon-клиенты остановлены")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1111,7 +1116,7 @@ async def stop_telethon_monitor():
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    global _bot_app
+    global _bot_app, _bot_loop
 
     if not config.BOT_TOKEN:
         print("❌ Задайте переменную окружения BOT_TOKEN!")
@@ -1124,16 +1129,15 @@ def main():
     start_health_server()
     log.info("Health check started on PORT=%s", os.environ.get("PORT", 10000))
 
-    # ── post_init: запуск Telethon-мониторинга ──
+    # ── post_init: запуск Telethon в отдельном потоке ──
     async def post_init(application: Application):
-        global _bot_app
+        global _bot_app, _bot_loop
         _bot_app = application
-        asyncio.create_task(restart_telethon_monitor())
-        log.info("🔄 Telethon-мониторинг запускается...")
-
-    # ── post_shutdown: остановка Telethon ──
-    async def post_shutdown(application: Application):
-        await stop_telethon_monitor()
+        _bot_loop = asyncio.get_event_loop()
+        # Запускаем Telethon в отдельном потоке
+        t = threading.Thread(target=telethon_worker, daemon=True)
+        t.start()
+        log.info("🔄 Telethon-мониторинг запущен в фоне")
 
     # ── Обработчик для неизвестных callback_query ──
     async def cb_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1149,7 +1153,6 @@ def main():
         Application.builder()
         .token(config.BOT_TOKEN)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
 
