@@ -842,8 +842,8 @@ async def cb_select_acc_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         matched_keywords=matched,
                         msg_date=msg.date,
                     )
-                    found_total += chat_found
 
+                found_total += chat_found
                 log.info(f"📜 [{phone}] {chat_id}: {chat_found} совпадений")
 
             except Exception as e:
