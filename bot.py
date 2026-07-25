@@ -34,6 +34,8 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneNumberInvalidError,
 )
 
+from telegram.error import BadRequest
+
 import config
 from healthcheck import start_health_server
 import storage
@@ -111,6 +113,15 @@ def confirm_keyboard(action: str) -> InlineKeyboardMarkup:
 #  /start  И  ГЛАВНОЕ МЕНЮ
 # ═══════════════════════════════════════════════════════════
 
+async def safe_edit(query, text, **kwargs):
+    """Безопасный edit_message_text — игнорирует 'Message is not modified'."""
+    try:
+        await query.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Приветствие + главное меню."""
     text = (
@@ -126,8 +137,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите действие:"
     )
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", reply_markup=main_menu_keyboard(),
+        await safe_edit(
+            update.callback_query, text,
+            parse_mode="HTML", reply_markup=main_menu_keyboard(),
         )
     else:
         await update.message.reply_text(
@@ -151,7 +163,8 @@ async def cb_add_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Шаг 1: запрос номера телефона."""
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         "📱 <b>Добавление аккаунта</b>\n\n"
         "Введите номер телефона в международном формате:\n"
         "<code>+79001234567</code>\n\n"
@@ -326,13 +339,15 @@ async def cb_add_chats_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = storage.load_user(user_id)
 
     if not data["accounts"]:
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "❌ Сначала добавьте хотя бы один аккаунт.",
             reply_markup=main_menu_keyboard(),
         )
         return STATE_MENU
 
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         "💬 <b>Добавление чатов</b>\n\n"
         "Выберите аккаунт, для которого добавляете чаты:",
         parse_mode="HTML",
@@ -351,7 +366,8 @@ async def cb_select_acc_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc = storage.get_account(update.effective_user.id, phone)
     current = ", ".join(acc["chats"]) if acc and acc["chats"] else "пусто"
 
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         f"💬 <b>Добавление чатов</b>\n"
         f"Аккаунт: <b>{phone}</b>\n"
         f"Текущие чаты: <code>{current}</code>\n\n"
@@ -417,13 +433,15 @@ async def cb_add_keywords_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = storage.load_user(user_id)
 
     if not data["accounts"]:
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "❌ Сначала добавьте хотя бы один аккаунт.",
             reply_markup=main_menu_keyboard(),
         )
         return STATE_MENU
 
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         "🔑 <b>Добавление ключевых слов</b>\n\n"
         "Выберите аккаунт:",
         parse_mode="HTML",
@@ -442,7 +460,8 @@ async def cb_select_acc_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc = storage.get_account(update.effective_user.id, phone)
     current = ", ".join(acc["keywords"]) if acc and acc["keywords"] else "пусто"
 
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         f"🔑 <b>Ключевые слова</b>\n"
         f"Аккаунт: <b>{phone}</b>\n"
         f"Текущие: <code>{current}</code>\n\n"
@@ -503,7 +522,8 @@ async def cb_set_notify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     current = data.get("notify_chat_id", user_id)
 
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         f"🔔 <b>Куда слать уведомления</b>\n\n"
         f"Текущий получатель: <code>{current}</code>\n\n"
         "Отправьте:\n"
@@ -574,8 +594,8 @@ async def cb_my_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"   Слова: <code>{kws}</code>",
             ])
 
-    await q.edit_message_text(
-        "\n".join(lines),
+    await safe_edit(
+        q, "\n".join(lines),
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
@@ -602,7 +622,8 @@ async def cb_start_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             not_ready.append(acc)
 
     if not ready:
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "❌ Нет аккаунтов с полной настройкой.\n\n"
             "Нужно: авторизованный аккаунт + чаты + ключевые слова.",
             reply_markup=main_menu_keyboard(),
@@ -626,7 +647,7 @@ async def cb_start_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for acc in not_ready:
             text += f"  ⚪ {acc.get('label', acc['phone'])}\n"
 
-    await q.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    await safe_edit(q, text, parse_mode="HTML", reply_markup=main_menu_keyboard())
     return STATE_MENU
 
 
@@ -643,7 +664,8 @@ async def cb_stop_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     restart_telethon_monitor(ctx.application)
 
-    await q.edit_message_text(
+    await safe_edit(
+        q,
         "⏹ Мониторинг остановлен для всех аккаунтов.",
         reply_markup=main_menu_keyboard(),
     )
@@ -877,8 +899,29 @@ def main():
     start_health_server()
     log.info("Health check started on PORT=%s", os.environ.get("PORT", 10000))
 
+    # ── Запуск Telethon в фоне ──
+    async def post_init(application: Application):
+        t = threading.Thread(target=telethon_worker, args=(application,), daemon=True)
+        t.start()
+        log.info("🔄 Telethon-мониторинг запущен в фоне")
+
+    # ── Обработчик для неизвестных callback_query (вне ConversationHandler) ──
+    async def cb_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Отвечаем на неизвестные callback, чтобы не было часиков."""
+        if update.callback_query:
+            await update.callback_query.answer()
+            await safe_edit(
+                update.callback_query,
+                "⚠️ Сессия устарела. Нажмите /start для перезапуска.",
+            )
+
     # ── Строим приложение ──
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # ── ConversationHandler ──
     conv = ConversationHandler(
@@ -931,14 +974,8 @@ def main():
     )
 
     app.add_handler(conv)
-
-    # ── Запуск Telethon в фоне ──
-    async def post_init(application: Application):
-        t = threading.Thread(target=telethon_worker, args=(application,), daemon=True)
-        t.start()
-        log.info("🔄 Telethon-мониторинг запущен в фоне")
-
-    app.post_init = post_init
+    # Глобальный обработчик невалидных callback (ловит то, что не поймал ConversationHandler)
+    app.add_handler(CallbackQueryHandler(cb_unknown), group=1)
 
     # ── Запуск бота ──
     log.info("🚀 Бот запущен!")
